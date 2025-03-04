@@ -1,101 +1,104 @@
 from flask import Flask, request, jsonify
-import pickle
-import sklearn
+import os
 import numpy as np
 import pandas as pd
+import yfinance as yf
+import pickle
 from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
 
 # Initialize Flask app
-print(pd.__version__)
-print(sklearn.__version__)
-print(pickle.format_version)
-print(tf.__version__)
 app = Flask(__name__)
+MODEL_DIR = "models"
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Load the model and scaler for a specific stock
+# Define global @tf.function to prevent retracing
+@tf.function(reduce_retracing=True)
+def predict_with_model(model, input_tensor):
+    return model(input_tensor, training=False)
+
+# Load model and scaler
 def load_model_and_scaler(stock_name):
-    try:
-        model_filename = f'{stock_name}_model.pkl'
-        scaler_filename = f'{stock_name}_scaler.pkl'
+    model_filename = os.path.join(MODEL_DIR, f'{stock_name}_model.pkl')
+    scaler_filename = os.path.join(MODEL_DIR, f'{stock_name}_scaler.pkl')
 
-        # Load the model and scaler using pickle
-        model = pickle.load(open(model_filename, 'rb'))
-        scaler = pickle.load(open(scaler_filename, 'rb'))
-
+    # Fix: Use correct variable names
+    if os.path.exists(model_filename) and os.path.exists(scaler_filename):
+        with open(model_filename, "rb") as model_file:
+            model = pickle.load(model_file)
+        with open(scaler_filename, "rb") as scaler_file:
+            scaler = pickle.load(scaler_file)
         return model, scaler
-    except FileNotFoundError:
-        return None, None
 
-# Prepare and preprocess data for the stock
+    return None, None
+
+
+# Preprocess stock data
 def preprocess_data(stock_name):
-    try:
-        # Load the CSV file for the stock (this assumes that the stock data is in the current directory)
-        data = pd.read_csv(f'{stock_name}.csv', header=None, skiprows=2)
-        # Assign proper column names
-        data.columns = ['Date', 'Close', 'High', 'Low', 'Open', 'Volume']
+    latest_data = yf.download(f"{stock_name}.NS", period="60d", interval="1d")
+    
+    if latest_data.empty or len(latest_data) < 2:
+        return None, "Not enough data for prediction."
 
-        # Clean and preprocess data
-        data = data.drop(index=0)
-        data.reset_index(drop=True, inplace=True)
-        data['Date'] = pd.to_datetime(data['Date'])
-        data['Day'] = data['Date'].dt.day
-        data['Month'] = data['Date'].dt.month
-        data['Year'] = data['Date'].dt.year
-        data['QuarterEnd'] = np.where(data['Month'] % 3 == 0, 1, 0)
+    latest_data['10_EMA'] = latest_data['Close'].ewm(span=10, adjust=False).mean()
+    latest_data['50_EMA'] = latest_data['Close'].ewm(span=50, adjust=False).mean()
+    latest_data['200_EMA'] = latest_data['Close'].ewm(span=200, adjust=False).mean()
+    latest_data['Open-Close'] = latest_data['Open'] - latest_data['Close']
+    latest_data['Low-High'] = latest_data['High'] - latest_data['Low']
 
-        # Feature Engineering: Using only necessary features
-        data['Open-Close'] = data['Open'] - data['Close']
-        data['Low-High'] = data['High'] - data['Low']
-        data['10_EMA'] = data['Close'].ewm(span=10, adjust=False).mean()
-        data['50_EMA'] = data['Close'].ewm(span=50, adjust=False).mean()
-        data['200_EMA'] = data['Close'].ewm(span=200, adjust=False).mean()
+    feature_columns = ["High", "Low", "Open", "Close", "Open-Close", "Low-High", "Volume", "10_EMA", "50_EMA", "200_EMA"]
+    latest_day = latest_data.iloc[-2]  # Use the previous day's data
 
-        # Normalize Features (use only relevant columns)
-        scaler = MinMaxScaler()
-        scaled_data = scaler.fit_transform(data[['High', 'Low', 'Open', 'Close', 'Open-Close', 'Low-High', 'Volume', '10_EMA', '50_EMA', '200_EMA']])
+    features = np.array([
+        latest_day["High"], latest_day["Low"], latest_day["Open"], latest_day["Close"],
+        latest_day["Open-Close"], latest_day["Low-High"], latest_day["Volume"],
+        latest_day["10_EMA"], latest_day["50_EMA"], latest_day["200_EMA"]
+    ], dtype=np.float32).reshape(1, -1)
+    print(features)
+    return features, None
 
-        return scaled_data, scaler
-    except Exception as e:
-        return None, str(e)
-
-# API endpoint to get the predicted closing price
+# Prediction endpoint
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        # Get the request data
         data = request.get_json()
-        stock_name = data['stock_name']
+        stock_name = data.get('stock_name')
 
-        # Load the model and scaler for the requested stock
+        if not stock_name:
+            return jsonify({"error": "Stock name is required"}), 400
+
+        # Load model & scaler
         model, scaler = load_model_and_scaler(stock_name)
-
         if model is None or scaler is None:
-            return jsonify({"error": f"Model or scaler for stock {stock_name} not found"}), 404
+            return jsonify({"error": f"Model or scaler not found for {stock_name}"}), 404
 
-        # Preprocess the data for the stock
-        scaled_data, error = preprocess_data(stock_name)
-        if scaled_data is None:
+        # Get features from previous day's data
+        features, error = preprocess_data(stock_name)
+        if features is None:
             return jsonify({"error": error}), 500
 
-        # Use the last 60 days of data for prediction
-        look_back = 60
-        last_60_days = scaled_data[-look_back:]  # Get the last 60 days
-        last_60_days = np.expand_dims(last_60_days, axis=0)  # Reshape for model input
+        # Scale input data
+        scaled_features = scaler.transform(features)
+        scaled_features = scaled_features.reshape(1, 1, -1)  # Shape: (1,1,10)
 
-        # Predict the next day's closing price using the model
-        predicted_price_scaled = model.predict(last_60_days)
+        # Convert to tensor to prevent retracing
+        input_tensor = tf.convert_to_tensor(scaled_features, dtype=tf.float32)
 
-        # Inverse the scaling to get the real predicted price
-        predicted_price = scaler.inverse_transform(np.concatenate((predicted_price_scaled, np.zeros((1, scaled_data.shape[1] - 1))), axis=1))[:, 0][0]
+        # Predict
+        next_day_scaled = predict_with_model(model, input_tensor).numpy()
 
-        # Return the predicted price in the response
-        return jsonify({"predicted_price": predicted_price})
+        # Prepare for inverse transformation
+        dummy_array = np.zeros((1, 10), dtype=np.float32)
+        dummy_array[:, 3] = next_day_scaled  # Insert predicted 'Close' price
 
+        # Convert back to original scale
+        predicted_price = scaler.inverse_transform(dummy_array)[:, 3][0]
+
+        return jsonify({"stock": stock_name, "predicted_price": round(float(predicted_price), 2)})
+    
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
+# Run Flask app
 if __name__ == '__main__':
-    # Run the Flask app
     app.run(debug=True, host='0.0.0.0', port=4960)
