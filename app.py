@@ -35,7 +35,7 @@ def load_model_and_scaler(stock_name):
 
 # Preprocess stock data
 def preprocess_data(stock_name):
-    latest_data = yf.download(f"{stock_name}.NS", period="60d", interval="1d")
+    latest_data = yf.download(f"{stock_name}.NS", period="10d", interval="1d")
     
     if latest_data.empty or len(latest_data) < 2:
         return None, "Not enough data for prediction."
